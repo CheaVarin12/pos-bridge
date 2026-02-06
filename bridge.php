@@ -11,12 +11,22 @@ use Mike42\Escpos\EscposImage;
 use Mike42\Escpos\Printer;
 
 // --- CONFIGURATION ---
-$baseUrl = "http://127.0.0.1:8000/"; 
-// $baseUrl = "https://admin.foodmonster.asia/";
+// $baseUrl = "http://127.0.0.1:8000/"; 
+$baseUrl = "https://admin.foodmonster.asia/";
 $apiUrl  = $baseUrl . "api/printer/sync"; 
 
 echo "--- BRIDGE (SCREENSHOT MODE) STARTED ---\n";
 echo "Target API: $apiUrl\n\n";
+
+// --- SINGLE INSTANCE LOCK ---
+$lockFile = __DIR__ . '/bridge.lock';
+$lockHandle = fopen($lockFile, 'c');
+if (!$lockHandle || !flock($lockHandle, LOCK_EX | LOCK_NB)) {
+    echo "[ERROR] Another bridge instance is already running.\n";
+    exit(1);
+}
+ftruncate($lockHandle, 0);
+fwrite($lockHandle, (string) getmypid());
 
 // --- SSL BYPASS CONFIGURATION ---
 // This allows the portable PHP to connect to HTTPS without certificate errors
@@ -30,6 +40,11 @@ $contextOptions = [
         "verify_peer_name" => false,
     ],
 ];
+
+// --- PRINT MODE ---
+// 'first' = stop after first successful printer (avoids double print)
+// 'all'   = print to every matching printer, ACK only if all succeed
+$printMode = 'first';
 
 // --- MAIN LOOP ---
 while (true) {
@@ -56,6 +71,9 @@ while (true) {
                         echo "   Image: " . substr($job['print_image_url'], 0, 50) . "...\n";
                     }
 
+                    $matchedPrinters = [];
+                    $matchedKeys = [];
+
                     foreach ($data['printers'] as $printer) {
                         $shouldPrint = false;
 
@@ -76,7 +94,50 @@ while (true) {
 
                         // Execute Print Job
                         if ($shouldPrint) {
-                            printImageJob($job, $printer, $baseUrl, $contextOptions);
+                            $printerIp = isset($printer['ip']) ? trim((string) $printer['ip']) : '';
+                            $printerName = isset($printer['name']) ? trim((string) $printer['name']) : '';
+                            $printType = isset($printer['print_type']) ? strtolower(trim((string) $printer['print_type'])) : '';
+                            $billType = isset($printer['bill_type']) ? strtolower(trim((string) $printer['bill_type'])) : '';
+                            $groupId = isset($printer['product_group_id']) ? (string) $printer['product_group_id'] : '';
+                            $key = implode('|', [$printType, $billType, $groupId, $printerIp, $printerName]);
+
+                            if (!isset($matchedKeys[$key])) {
+                                $matchedKeys[$key] = true;
+                                $matchedPrinters[] = $printer;
+                            }
+                        }
+                    }
+
+                    if (count($matchedPrinters) === 0) {
+                        echo "   [WARN] No matching printer for job.\n";
+                        continue;
+                    }
+
+                    if ($printMode === 'first') {
+                        $printed = false;
+                        foreach ($matchedPrinters as $printer) {
+                            if (printImageJob($job, $printer, $baseUrl, $contextOptions)) {
+                                $printed = true;
+                                break;
+                            }
+                        }
+                        if ($printed) {
+                            ackJob($job, $baseUrl, $contextOptions);
+                        } else {
+                            echo "   [WARN] Print failed. Job will retry.\n";
+                        }
+                    } else {
+                        $targetCount = count($matchedPrinters);
+                        $successCount = 0;
+                        foreach ($matchedPrinters as $printer) {
+                            if (printImageJob($job, $printer, $baseUrl, $contextOptions)) {
+                                $successCount++;
+                            }
+                        }
+                        if ($successCount === $targetCount) {
+                            ackJob($job, $baseUrl, $contextOptions);
+                        } else {
+                            echo "   [WARN] Some printers failed. Job will retry.\n";
                         }
                     }
                 }
@@ -92,6 +153,8 @@ while (true) {
 
 // --- PRINT FUNCTION ---
 function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
+    $success = false;
+
     // Determine Target (IP or USB Name)
     $target = $printerConfig['ip'];
     $isUsb = (empty($target) || $target === 'NULL');
@@ -176,6 +239,7 @@ function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
                 try {
                     $escposImg = EscposImage::load($tempFile);
                     $printer->bitImage($escposImg);
+                    $success = true;
                 } catch (Exception $e) {
                     echo " [Image Error] " . $e->getMessage();
                     $printer->text("Error: Could not process image.\n");
@@ -196,10 +260,39 @@ function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
         $printer->feed(3);
         $printer->cut();
         $printer->close();
-        echo " [OK]\n";
+        echo $success ? " [OK]\n" : " [FAILED]\n";
 
     } catch (Exception $e) {
         echo " [ERROR] " . $e->getMessage() . "\n";
     }
+
+    return $success;
+}
+
+// --- ACK FUNCTION ---
+function ackJob($job, $baseUrl, $contextOptions) {
+    $ackUrl = rtrim($baseUrl, '/') . '/api/printer/ack';
+    $payload = http_build_query([
+        'id' => $job['id'] ?? null,
+        'job_type' => $job['job_type'] ?? null,
+    ]);
+
+    $postOptions = $contextOptions;
+    $postOptions['http'] = array_merge($postOptions['http'], [
+        'method'  => 'POST',
+        'header'  => "Content-Type: application/x-www-form-urlencoded\r\n",
+        'content' => $payload,
+    ]);
+
+    $ctx = stream_context_create($postOptions);
+    $result = @file_get_contents($ackUrl, false, $ctx);
+
+    if ($result === false) {
+        echo "   [ACK ERROR] Could not notify server.\n";
+        return false;
+    }
+
+    echo "   [ACK OK]\n";
+    return true;
 }
 ?>
