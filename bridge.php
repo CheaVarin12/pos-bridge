@@ -7,7 +7,7 @@ require __DIR__ . '/vendor/autoload.php';
 
 use Mike42\Escpos\PrintConnectors\WindowsPrintConnector;
 use Mike42\Escpos\PrintConnectors\NetworkPrintConnector;
-use Mike42\Escpos\EscposImage;
+use Mike42\Escpos\GdEscposImage;
 use Mike42\Escpos\Printer;
 
 // --- CONFIGURATION ---
@@ -48,6 +48,9 @@ $contextOptions = [
 $printMode = 'first';
 $recentDuplicateWindowSeconds = 20;
 $recentlyPrintedJobs = [];
+// Split tall receipts into smaller raster blocks so ESC/POS printers do not choke on one huge image.
+$maxRasterChunkHeight = 512;
+$rasterChunkPauseMicros = 20000;
 
 // --- MAIN LOOP ---
 while (true) {
@@ -243,22 +246,13 @@ function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
 
             // PRINT THE IMAGE
             if ($imageContent) {
-                // 1. Write to Temp File
-                $tempFile = __DIR__ . '/print_' . rand() . '.png';
-                file_put_contents($tempFile, $imageContent);
-
-                // 2. Load and Print
                 try {
-                    $escposImg = EscposImage::load($tempFile);
-                    $printer->bitImage($escposImg);
+                    printRasterImageInChunks($printer, $imageContent);
                     $success = true;
                 } catch (Exception $e) {
                     echo " [Image Error] " . $e->getMessage();
                     $printer->text("Error: Could not process image.\n");
                 }
-
-                // 3. Cleanup
-                if (file_exists($tempFile)) unlink($tempFile);
             } else {
                 echo " [Download Error] Could not fetch image.\n";
                 $printer->text("Error: Image not found on server.\n");
@@ -279,6 +273,69 @@ function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
     }
 
     return $success;
+}
+
+function printRasterImageInChunks(Printer $printer, $imageContent) {
+    global $maxRasterChunkHeight, $rasterChunkPauseMicros;
+
+    if (!extension_loaded('gd') || !function_exists('imagecreatefromstring')) {
+        throw new Exception("GD extension is required for receipt image printing.");
+    }
+
+    $sourceImage = @imagecreatefromstring($imageContent);
+    if ($sourceImage === false) {
+        throw new Exception("Could not decode receipt image.");
+    }
+
+    try {
+        $width = imagesx($sourceImage);
+        $height = imagesy($sourceImage);
+
+        if ($width <= 0 || $height <= 0) {
+            throw new Exception("Receipt image has invalid dimensions.");
+        }
+
+        $chunkHeight = resolveRasterChunkHeight($width, $maxRasterChunkHeight);
+        $chunkCount = (int) ceil($height / $chunkHeight);
+
+        echo "\n    Rendering {$width}x{$height}px in {$chunkCount} chunk(s)\n";
+
+        for ($offsetY = 0, $chunkIndex = 1; $offsetY < $height; $offsetY += $chunkHeight, $chunkIndex++) {
+            $currentHeight = min($chunkHeight, $height - $offsetY);
+            $chunkImage = imagecreatetruecolor($width, $currentHeight);
+
+            if ($chunkImage === false) {
+                throw new Exception("Could not allocate printer image chunk.");
+            }
+
+            $white = imagecolorallocate($chunkImage, 255, 255, 255);
+            imagefill($chunkImage, 0, 0, $white);
+            imagealphablending($chunkImage, true);
+            imagecopy($chunkImage, $sourceImage, 0, 0, 0, $offsetY, $width, $currentHeight);
+
+            try {
+                $escposImg = new GdEscposImage();
+                $escposImg->readImageFromGdResource($chunkImage);
+                $printer->bitImage($escposImg);
+            } finally {
+                imagedestroy($chunkImage);
+            }
+
+            if ($chunkIndex < $chunkCount && $rasterChunkPauseMicros > 0) {
+                usleep($rasterChunkPauseMicros);
+            }
+        }
+    } finally {
+        imagedestroy($sourceImage);
+    }
+}
+
+function resolveRasterChunkHeight($widthPixels, $maxChunkHeight) {
+    $widthBytes = max(1, (int) ceil($widthPixels / 8));
+    $maxBytesPerChunk = 48000;
+    $chunkHeightFromWidth = (int) floor($maxBytesPerChunk / $widthBytes);
+
+    return max(64, min((int) $maxChunkHeight, $chunkHeightFromWidth));
 }
 
 function buildRecentPrintKey($job) {
