@@ -11,8 +11,9 @@ use Mike42\Escpos\EscposImage;
 use Mike42\Escpos\Printer;
 
 // --- CONFIGURATION ---
-// $baseUrl = "http://127.0.0.1:8000/"; 
-$baseUrl = "https://admin.foodmonster.asia/";
+$baseUrl = "http://127.0.0.1:8000/"; 
+// $baseUrl = "https://admin.foodmonster.asia/";
+// $baseUrl = "https://staging.foodmonster.asia/";
 $apiUrl  = $baseUrl . "api/printer/sync"; 
 
 echo "--- BRIDGE (SCREENSHOT MODE) STARTED ---\n";
@@ -45,6 +46,8 @@ $contextOptions = [
 // 'first' = stop after first successful printer (avoids double print)
 // 'all'   = print to every matching printer, ACK only if all succeed
 $printMode = 'first';
+$recentDuplicateWindowSeconds = 20;
+$recentlyPrintedJobs = [];
 
 // --- MAIN LOOP ---
 while (true) {
@@ -66,6 +69,13 @@ while (true) {
                 echo "\n[NEW JOB] Found " . count($data['orders']) . " orders!\n";
                 
                 foreach ($data['orders'] as $job) {
+                    if (wasRecentlyPrinted($job, $recentlyPrintedJobs, $recentDuplicateWindowSeconds)) {
+                        $sourceId = $job['source_id'] ?? $job['id'] ?? 'unknown';
+                        echo "   [SKIP] Duplicate job detected for source $sourceId.\n";
+                        ackJob($job, $baseUrl, $contextOptions);
+                        continue;
+                    }
+
                     // Log image URL for debugging
                     if (!empty($job['print_image_url'])) {
                         echo "   Image: " . substr($job['print_image_url'], 0, 50) . "...\n";
@@ -122,6 +132,7 @@ while (true) {
                             }
                         }
                         if ($printed) {
+                            rememberPrintedJob($job, $recentlyPrintedJobs, $recentDuplicateWindowSeconds);
                             ackJob($job, $baseUrl, $contextOptions);
                         } else {
                             echo "   [WARN] Print failed. Job will retry.\n";
@@ -135,6 +146,7 @@ while (true) {
                             }
                         }
                         if ($successCount === $targetCount) {
+                            rememberPrintedJob($job, $recentlyPrintedJobs, $recentDuplicateWindowSeconds);
                             ackJob($job, $baseUrl, $contextOptions);
                         } else {
                             echo "   [WARN] Some printers failed. Job will retry.\n";
@@ -267,6 +279,39 @@ function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
     }
 
     return $success;
+}
+
+function buildRecentPrintKey($job) {
+    $jobType = isset($job['job_type']) ? strtolower(trim((string) $job['job_type'])) : 'unknown';
+    $sourceId = isset($job['source_id']) && $job['source_id'] !== null && $job['source_id'] !== ''
+        ? (string) $job['source_id']
+        : (string) ($job['id'] ?? 'unknown');
+    $billType = isset($job['type']) ? strtolower(trim((string) $job['type'])) : '';
+    $groupId = isset($job['group_id']) ? (string) $job['group_id'] : '';
+
+    return implode('|', [$jobType, $sourceId, $billType, $groupId]);
+}
+
+function pruneRecentPrintedJobs(&$recentlyPrintedJobs, $windowSeconds) {
+    $cutoff = time() - max(1, (int) $windowSeconds);
+
+    foreach ($recentlyPrintedJobs as $key => $printedAt) {
+        if ($printedAt < $cutoff) {
+            unset($recentlyPrintedJobs[$key]);
+        }
+    }
+}
+
+function wasRecentlyPrinted($job, &$recentlyPrintedJobs, $windowSeconds) {
+    pruneRecentPrintedJobs($recentlyPrintedJobs, $windowSeconds);
+    $key = buildRecentPrintKey($job);
+
+    return isset($recentlyPrintedJobs[$key]);
+}
+
+function rememberPrintedJob($job, &$recentlyPrintedJobs, $windowSeconds) {
+    pruneRecentPrintedJobs($recentlyPrintedJobs, $windowSeconds);
+    $recentlyPrintedJobs[buildRecentPrintKey($job)] = time();
 }
 
 // --- ACK FUNCTION ---
