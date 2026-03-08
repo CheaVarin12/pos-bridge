@@ -5,6 +5,7 @@ ini_set('memory_limit', '256M');
 
 require __DIR__ . '/vendor/autoload.php';
 
+use Mike42\Escpos\PrintConnectors\CupsPrintConnector;
 use Mike42\Escpos\PrintConnectors\WindowsPrintConnector;
 use Mike42\Escpos\PrintConnectors\NetworkPrintConnector;
 use Mike42\Escpos\GdEscposImage;
@@ -18,6 +19,8 @@ $apiUrl  = $baseUrl . "api/printer/sync";
 
 echo "--- BRIDGE (SCREENSHOT MODE) STARTED ---\n";
 echo "Target API: $apiUrl\n\n";
+
+assertRuntimeRequirements();
 
 // --- SINGLE INSTANCE LOCK ---
 $lockFile = __DIR__ . '/bridge.lock';
@@ -158,7 +161,7 @@ while (true) {
                 }
             }
         }
-    } catch (Exception $e) { 
+    } catch (Throwable $e) { 
         echo "\n[Error] " . $e->getMessage() . "\n";
     }
     
@@ -181,19 +184,7 @@ function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
     echo " -> Printing to $target... ";
 
     try {
-        // Connect to Printer
-        if ($isUsb) {
-            try {
-                // Try SMB first (Shared Printer)
-                $connector = new WindowsPrintConnector("smb://localhost/" . $target);
-            } catch (Exception $e) {
-                // Fallback to Direct Name
-                $connector = new WindowsPrintConnector($target);
-            }
-        } else {
-            // Network Printer
-            $connector = new NetworkPrintConnector($target, 9100);
-        }
+        $connector = createPrinterConnector($target, $isUsb);
 
         $printer = new Printer($connector);
         $printer->setJustification(Printer::JUSTIFY_CENTER);
@@ -268,11 +259,72 @@ function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
         $printer->close();
         echo $success ? " [OK]\n" : " [FAILED]\n";
 
-    } catch (Exception $e) {
+    } catch (Throwable $e) {
         echo " [ERROR] " . $e->getMessage() . "\n";
     }
 
     return $success;
+}
+
+function assertRuntimeRequirements() {
+    $missing = [];
+
+    if (!extension_loaded('intl') || !class_exists('IntlBreakIterator') || !class_exists('UConverter')) {
+        $missing[] = 'intl';
+    }
+
+    if (!extension_loaded('gd') || !function_exists('imagecreatefromstring')) {
+        $missing[] = 'gd';
+    }
+
+    if (count($missing) === 0) {
+        return;
+    }
+
+    echo "[ERROR] Missing PHP extension(s): " . implode(', ', $missing) . "\n";
+    echo "        Current PHP: " . PHP_VERSION . " on " . PHP_OS_FAMILY . "\n";
+
+    if (PHP_OS_FAMILY === 'Linux') {
+        $packages = [];
+        $phpMinorVersion = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+
+        foreach ($missing as $extension) {
+            $packages[] = "php{$phpMinorVersion}-{$extension}";
+        }
+
+        echo "        Install with: sudo apt install " . implode(' ', $packages) . "\n";
+    } else {
+        echo "        Enable these extensions in php.ini before running the bridge.\n";
+    }
+
+    exit(1);
+}
+
+function createPrinterConnector($target, $isUsb) {
+    if (!$isUsb) {
+        return new NetworkPrintConnector($target, 9100);
+    }
+
+    $target = trim((string) $target);
+    $isSmbTarget = preg_match('#^smb://#i', $target) === 1;
+
+    if (PHP_OS_FAMILY === 'Windows') {
+        if ($isSmbTarget) {
+            return new WindowsPrintConnector($target);
+        }
+
+        try {
+            return new WindowsPrintConnector("smb://localhost/" . $target);
+        } catch (Exception $e) {
+            return new WindowsPrintConnector($target);
+        }
+    }
+
+    if ($isSmbTarget) {
+        return new WindowsPrintConnector($target);
+    }
+
+    return new CupsPrintConnector($target);
 }
 
 function printRasterImageInChunks(Printer $printer, $imageContent) {
