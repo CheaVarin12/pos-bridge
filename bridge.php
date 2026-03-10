@@ -12,13 +12,26 @@ use Mike42\Escpos\GdEscposImage;
 use Mike42\Escpos\Printer;
 
 // --- CONFIGURATION ---
-$baseUrl = "http://127.0.0.1:8000/"; 
+$baseUrl = "http://127.0.0.1:8000/";
 // $baseUrl = "https://admin.foodmonster.asia/";
 // $baseUrl = "https://staging.foodmonster.asia/";
-$apiUrl  = $baseUrl . "api/printer/sync"; 
+$bridgeConfig = [
+    'user_id' => trim((string) (getenv('BRIDGE_USER_ID') ?: '')),
+    'token' => trim((string) (getenv('BRIDGE_TOKEN') ?: '')),
+    'bridge_id' => trim((string) (getenv('BRIDGE_ID') ?: '')) ?: ('bridge-' . substr(sha1((string) php_uname('n')), 0, 12)),
+];
+$apiUrl = applyBridgeAuthToUrl($baseUrl . "api/printer/sync", $bridgeConfig);
 
 echo "--- BRIDGE (SCREENSHOT MODE) STARTED ---\n";
 echo "Target API: $apiUrl\n\n";
+echo "Bridge ID: {$bridgeConfig['bridge_id']}\n";
+if ($bridgeConfig['user_id'] !== '') {
+    echo "Bridge User ID: {$bridgeConfig['user_id']}\n";
+}
+if ($bridgeConfig['token'] !== '') {
+    echo "Bridge Token: configured\n";
+}
+echo "\n";
 
 assertRuntimeRequirements();
 
@@ -36,7 +49,7 @@ fwrite($lockHandle, (string) getmypid());
 // This allows the portable PHP to connect to HTTPS without certificate errors
 $contextOptions = [
     'http' => [
-        'timeout' => 10,
+        'timeout' => 30,
         'ignore_errors' => true
     ],
     "ssl" => [
@@ -58,17 +71,19 @@ $rasterChunkPauseMicros = 20000;
 // --- MAIN LOOP ---
 while (true) {
     try {
-        // Create a stream context with SSL disabled
-        $ctx = stream_context_create($contextOptions);
-        
-        // Attempt to download JSON from the API
-        $json = @file_get_contents($apiUrl, false, $ctx);
+        $syncResponse = httpRequest('GET', $apiUrl, $contextOptions, buildBridgeHeaders($bridgeConfig));
 
-        if ($json === false) {
+        if (!$syncResponse['ok']) {
             // Echo a dot to show the script is running but waiting for connection
-            echo "."; 
+            echo ".";
         } else {
-            $data = json_decode($json, true);
+            $data = json_decode($syncResponse['body'], true);
+
+            if (!is_array($data)) {
+                echo "\n[SYNC ERROR] Invalid JSON from sync endpoint (HTTP {$syncResponse['status']}).\n";
+                sleep(3);
+                continue;
+            }
 
             // Check if we found any orders/jobs
             if ($data && !empty($data['orders'])) {
@@ -78,7 +93,7 @@ while (true) {
                     if (wasRecentlyPrinted($job, $recentlyPrintedJobs, $recentDuplicateWindowSeconds)) {
                         $sourceId = $job['source_id'] ?? $job['id'] ?? 'unknown';
                         echo "   [SKIP] Duplicate job detected for source $sourceId.\n";
-                        ackJob($job, $baseUrl, $contextOptions);
+                        ackJob($job, $baseUrl, $contextOptions, $bridgeConfig);
                         continue;
                     }
 
@@ -108,6 +123,10 @@ while (true) {
                             $shouldPrint = true;
                         }
 
+                        if ($shouldPrint && !jobTargetsPrinter($job, $printer)) {
+                            $shouldPrint = false;
+                        }
+
                         // Execute Print Job
                         if ($shouldPrint) {
                             $printerIp = isset($printer['ip']) ? trim((string) $printer['ip']) : '';
@@ -126,36 +145,54 @@ while (true) {
 
                     if (count($matchedPrinters) === 0) {
                         echo "   [WARN] No matching printer for job.\n";
+                        ackJob($job, $baseUrl, $contextOptions, $bridgeConfig, 'failed', 'No matching printer found for this job.');
                         continue;
                     }
 
                     if ($printMode === 'first') {
                         $printed = false;
+                        $errors = [];
                         foreach ($matchedPrinters as $printer) {
-                            if (printImageJob($job, $printer, $baseUrl, $contextOptions)) {
+                            $result = printImageJob($job, $printer, $baseUrl, $contextOptions, $bridgeConfig);
+                            if ($result['ok']) {
                                 $printed = true;
                                 break;
+                            }
+
+                            if (!empty($result['error'])) {
+                                $errors[] = buildPrinterFailureMessage($printer, $result['error']);
                             }
                         }
                         if ($printed) {
                             rememberPrintedJob($job, $recentlyPrintedJobs, $recentDuplicateWindowSeconds);
-                            ackJob($job, $baseUrl, $contextOptions);
+                            ackJob($job, $baseUrl, $contextOptions, $bridgeConfig);
                         } else {
-                            echo "   [WARN] Print failed. Job will retry.\n";
+                            $failureMessage = implode(' | ', array_slice($errors, 0, 3));
+                            echo "   [WARN] Print failed. Marking job as failed.\n";
+                            ackJob($job, $baseUrl, $contextOptions, $bridgeConfig, 'failed', $failureMessage);
                         }
                     } else {
                         $targetCount = count($matchedPrinters);
                         $successCount = 0;
+                        $errors = [];
                         foreach ($matchedPrinters as $printer) {
-                            if (printImageJob($job, $printer, $baseUrl, $contextOptions)) {
+                            $result = printImageJob($job, $printer, $baseUrl, $contextOptions, $bridgeConfig);
+                            if ($result['ok']) {
                                 $successCount++;
+                                continue;
+                            }
+
+                            if (!empty($result['error'])) {
+                                $errors[] = buildPrinterFailureMessage($printer, $result['error']);
                             }
                         }
                         if ($successCount === $targetCount) {
                             rememberPrintedJob($job, $recentlyPrintedJobs, $recentDuplicateWindowSeconds);
-                            ackJob($job, $baseUrl, $contextOptions);
+                            ackJob($job, $baseUrl, $contextOptions, $bridgeConfig);
                         } else {
-                            echo "   [WARN] Some printers failed. Job will retry.\n";
+                            $failureMessage = implode(' | ', array_slice($errors, 0, 3));
+                            echo "   [WARN] Some printers failed. Marking job as failed.\n";
+                            ackJob($job, $baseUrl, $contextOptions, $bridgeConfig, 'failed', $failureMessage);
                         }
                     }
                 }
@@ -170,11 +207,13 @@ while (true) {
 }
 
 // --- PRINT FUNCTION ---
-function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
+function printImageJob($data, $printerConfig, $baseUrl, $contextOptions, $bridgeConfig) {
     $success = false;
+    $errorMessage = null;
+    $printer = null;
 
     // Determine Target (IP or USB Name)
-    $target = $printerConfig['ip'];
+    $target = $printerConfig['ip'] ?? '';
     $isUsb = (empty($target) || $target === 'NULL');
     
     if ($isUsb) {
@@ -216,23 +255,13 @@ function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
 
             // CHECK 3: It is a URL (Download it)
             if ($imageContent === null) {
-                // Formatting: Ensure we have a valid Absolute URL
-                if (preg_match('#^https?://#i', $rawUrl)) {
-                    // Already a full URL
-                    $imgUrl = $rawUrl;
-                } elseif (preg_match('#^/https?://#i', $rawUrl)) {
-                    // Full URL but prefixed with a slash
-                    $imgUrl = ltrim($rawUrl, '/');
+                $downloadResult = downloadImagePayload($rawUrl, $baseUrl, $contextOptions, $bridgeConfig);
+                if ($downloadResult['ok']) {
+                    $imageContent = $downloadResult['body'];
                 } else {
-                    // Relative path (e.g. storage/receipts...), so add base URL
-                    $imgUrl = rtrim($baseUrl, '/') . '/' . ltrim($rawUrl, '/');
+                    $errorMessage = $downloadResult['error'];
+                    echo " [Download Error] {$errorMessage}";
                 }
-
-                echo "\n    Downloading: $imgUrl\n";
-                
-                // USE SSL CONTEXT TO DOWNLOAD (Critical for HTTPS)
-                $ctx = stream_context_create($contextOptions);
-                $imageContent = @file_get_contents($imgUrl, false, $ctx);
             }
 
             // PRINT THE IMAGE
@@ -241,29 +270,43 @@ function printImageJob($data, $printerConfig, $baseUrl, $contextOptions) {
                     printRasterImageInChunks($printer, $imageContent);
                     $success = true;
                 } catch (Exception $e) {
-                    echo " [Image Error] " . $e->getMessage();
-                    $printer->text("Error: Could not process image.\n");
+                    $errorMessage = $e->getMessage();
+                    echo " [Image Error] " . $errorMessage;
                 }
             } else {
-                echo " [Download Error] Could not fetch image.\n";
-                $printer->text("Error: Image not found on server.\n");
+                $errorMessage = $errorMessage ?: 'Could not fetch image.';
+                echo " [Download Error] {$errorMessage}";
             }
 
         } else {
-            $printer->text("No Image Data.\n");
+            $errorMessage = 'No image data received for print job.';
+            echo " [Image Error] {$errorMessage}";
         }
 
         // Finish Job
-        $printer->feed(3);
-        $printer->cut();
+        if ($success) {
+            $printer->feed(3);
+            $printer->cut();
+        }
         $printer->close();
         echo $success ? " [OK]\n" : " [FAILED]\n";
 
     } catch (Throwable $e) {
-        echo " [ERROR] " . $e->getMessage() . "\n";
+        $errorMessage = $e->getMessage();
+        echo " [ERROR] " . $errorMessage . "\n";
+    } finally {
+        if ($printer instanceof Printer) {
+            try {
+                $printer->close();
+            } catch (Throwable $closeError) {
+            }
+        }
     }
 
-    return $success;
+    return [
+        'ok' => $success,
+        'error' => $errorMessage,
+    ];
 }
 
 function assertRuntimeRequirements() {
@@ -390,6 +433,36 @@ function resolveRasterChunkHeight($widthPixels, $maxChunkHeight) {
     return max(64, min((int) $maxChunkHeight, $chunkHeightFromWidth));
 }
 
+function normalizePrinterMatchValue($value) {
+    $value = trim((string) $value);
+
+    if ($value === '') {
+        return null;
+    }
+
+    return strtolower($value);
+}
+
+function jobTargetsPrinter($job, $printer) {
+    $targetPrinterId = normalizePrinterMatchValue($job['printer_list_id'] ?? null);
+    $targetPrinterIp = normalizePrinterMatchValue($job['printer_ip'] ?? null);
+    $targetPrinterName = normalizePrinterMatchValue($job['printer_name'] ?? null);
+
+    if ($targetPrinterId !== null) {
+        return normalizePrinterMatchValue($printer['id'] ?? null) === $targetPrinterId;
+    }
+
+    if ($targetPrinterIp !== null) {
+        return normalizePrinterMatchValue($printer['ip'] ?? null) === $targetPrinterIp;
+    }
+
+    if ($targetPrinterName !== null) {
+        return normalizePrinterMatchValue($printer['name'] ?? null) === $targetPrinterName;
+    }
+
+    return true;
+}
+
 function buildRecentPrintKey($job) {
     $jobType = isset($job['job_type']) ? strtolower(trim((string) $job['job_type'])) : 'unknown';
     $sourceId = isset($job['source_id']) && $job['source_id'] !== null && $job['source_id'] !== ''
@@ -397,8 +470,11 @@ function buildRecentPrintKey($job) {
         : (string) ($job['id'] ?? 'unknown');
     $billType = isset($job['type']) ? strtolower(trim((string) $job['type'])) : '';
     $groupId = isset($job['group_id']) ? (string) $job['group_id'] : '';
+    $printerId = normalizePrinterMatchValue($job['printer_list_id'] ?? null) ?? '';
+    $printerIp = normalizePrinterMatchValue($job['printer_ip'] ?? null) ?? '';
+    $printerName = normalizePrinterMatchValue($job['printer_name'] ?? null) ?? '';
 
-    return implode('|', [$jobType, $sourceId, $billType, $groupId]);
+    return implode('|', [$jobType, $sourceId, $billType, $groupId, $printerId, $printerIp, $printerName]);
 }
 
 function pruneRecentPrintedJobs(&$recentlyPrintedJobs, $windowSeconds) {
@@ -424,29 +500,234 @@ function rememberPrintedJob($job, &$recentlyPrintedJobs, $windowSeconds) {
 }
 
 // --- ACK FUNCTION ---
-function ackJob($job, $baseUrl, $contextOptions) {
+function ackJob($job, $baseUrl, $contextOptions, $bridgeConfig, $status = 'printed', $errorMessage = null) {
     $ackUrl = rtrim($baseUrl, '/') . '/api/printer/ack';
-    $payload = http_build_query([
+    $payloadData = [
         'id' => $job['id'] ?? null,
         'job_type' => $job['job_type'] ?? null,
-    ]);
+        'status' => $status,
+    ];
+    if ($errorMessage !== null && trim($errorMessage) !== '') {
+        $payloadData['error'] = trim((string) $errorMessage);
+    }
+    if ($bridgeConfig['user_id'] !== '') {
+        $payloadData['user_id'] = $bridgeConfig['user_id'];
+    }
+    if ($bridgeConfig['token'] !== '') {
+        $payloadData['token'] = $bridgeConfig['token'];
+    }
 
-    $postOptions = $contextOptions;
-    $postOptions['http'] = array_merge($postOptions['http'], [
-        'method'  => 'POST',
-        'header'  => "Content-Type: application/x-www-form-urlencoded\r\n",
-        'content' => $payload,
-    ]);
+    $payload = http_build_query($payloadData);
+    $response = httpRequest(
+        'POST',
+        $ackUrl,
+        $contextOptions,
+        buildBridgeHeaders($bridgeConfig, [
+            'Content-Type: application/x-www-form-urlencoded',
+        ]),
+        $payload
+    );
 
-    $ctx = stream_context_create($postOptions);
-    $result = @file_get_contents($ackUrl, false, $ctx);
-
-    if ($result === false) {
-        echo "   [ACK ERROR] Could not notify server.\n";
+    if (!$response['ok']) {
+        $bodyPreview = trim(substr((string) $response['body'], 0, 180));
+        echo "   [ACK ERROR] HTTP {$response['status']}";
+        if ($bodyPreview !== '') {
+            echo " - {$bodyPreview}";
+        }
+        echo "\n";
         return false;
     }
 
-    echo "   [ACK OK]\n";
+    echo "   [ACK OK] {$status}\n";
     return true;
+}
+
+function buildPrinterFailureMessage($printer, $error) {
+    $name = trim((string) ($printer['name'] ?? ''));
+    $ip = trim((string) ($printer['ip'] ?? ''));
+    $target = $ip !== '' ? $ip : ($name !== '' ? $name : 'unknown-printer');
+
+    return "{$target}: " . trim((string) $error);
+}
+
+function downloadImagePayload($rawUrl, $baseUrl, $contextOptions, $bridgeConfig) {
+    if (preg_match('#^https?://#i', $rawUrl)) {
+        $imgUrl = $rawUrl;
+    } elseif (preg_match('#^/https?://#i', $rawUrl)) {
+        $imgUrl = ltrim($rawUrl, '/');
+    } else {
+        $imgUrl = rtrim($baseUrl, '/') . '/' . ltrim($rawUrl, '/');
+    }
+
+    $imgUrl = applyBridgeAuthToUrl($imgUrl, $bridgeConfig);
+    echo "\n    Downloading: $imgUrl\n";
+
+    $response = httpRequest('GET', $imgUrl, $contextOptions, buildBridgeHeaders($bridgeConfig), null, 45);
+    if (!$response['ok']) {
+        return [
+            'ok' => false,
+            'error' => 'Server returned HTTP ' . $response['status'] . ' for image request.',
+        ];
+    }
+
+    $contentType = strtolower((string) findResponseHeader($response['headers'], 'Content-Type'));
+    $hasImageBytes = isRecognizedImageBytes($response['body']);
+    if ($contentType !== '' && strpos($contentType, 'image/') !== 0 && !$hasImageBytes) {
+        $bodyPreview = trim(substr((string) $response['body'], 0, 180));
+        return [
+            'ok' => false,
+            'error' => $bodyPreview !== ''
+                ? "Expected image response but received {$contentType}: {$bodyPreview}"
+                : "Expected image response but received {$contentType}",
+        ];
+    }
+
+    if (!$hasImageBytes) {
+        return [
+            'ok' => false,
+            'error' => 'Downloaded payload is not a valid PNG/JPG/GIF image.',
+        ];
+    }
+
+    return [
+        'ok' => true,
+        'body' => $response['body'],
+    ];
+}
+
+function buildBridgeHeaders($bridgeConfig, $headers = []) {
+    $result = $headers;
+    $result[] = 'Accept: application/json, image/png, image/jpeg, image/gif;q=0.9, */*;q=0.8';
+    $result[] = 'X-Bridge-Id: ' . $bridgeConfig['bridge_id'];
+
+    if ($bridgeConfig['token'] !== '') {
+        $result[] = 'X-Bridge-Token: ' . $bridgeConfig['token'];
+    }
+
+    return $result;
+}
+
+function applyBridgeAuthToUrl($url, $bridgeConfig) {
+    $params = [];
+
+    if ($bridgeConfig['user_id'] !== '') {
+        $params['user_id'] = $bridgeConfig['user_id'];
+    }
+    if ($bridgeConfig['token'] !== '') {
+        $params['token'] = $bridgeConfig['token'];
+    }
+
+    if (!$params) {
+        return $url;
+    }
+
+    $parts = parse_url($url);
+    $query = [];
+    if (!empty($parts['query'])) {
+        parse_str($parts['query'], $query);
+    }
+
+    foreach ($params as $key => $value) {
+        if (!array_key_exists($key, $query) || trim((string) $query[$key]) === '') {
+            $query[$key] = $value;
+        }
+    }
+
+    $rebuilt = '';
+    if (isset($parts['scheme'])) {
+        $rebuilt .= $parts['scheme'] . '://';
+    }
+    if (isset($parts['user'])) {
+        $rebuilt .= $parts['user'];
+        if (isset($parts['pass'])) {
+            $rebuilt .= ':' . $parts['pass'];
+        }
+        $rebuilt .= '@';
+    }
+    if (isset($parts['host'])) {
+        $rebuilt .= $parts['host'];
+    }
+    if (isset($parts['port'])) {
+        $rebuilt .= ':' . $parts['port'];
+    }
+    $rebuilt .= $parts['path'] ?? '';
+    if ($query) {
+        $rebuilt .= '?' . http_build_query($query);
+    }
+    if (isset($parts['fragment'])) {
+        $rebuilt .= '#' . $parts['fragment'];
+    }
+
+    return $rebuilt;
+}
+
+function httpRequest($method, $url, $contextOptions, $headers = [], $content = null, $timeout = null) {
+    $requestOptions = $contextOptions;
+    $requestOptions['http'] = $requestOptions['http'] ?? [];
+    $requestOptions['http']['method'] = strtoupper($method);
+    $requestOptions['http']['ignore_errors'] = true;
+
+    if ($timeout !== null) {
+        $requestOptions['http']['timeout'] = $timeout;
+    }
+    if ($headers) {
+        $requestOptions['http']['header'] = implode("\r\n", $headers) . "\r\n";
+    }
+    if ($content !== null) {
+        $requestOptions['http']['content'] = $content;
+    } else {
+        unset($requestOptions['http']['content']);
+    }
+
+    $ctx = stream_context_create($requestOptions);
+    $body = @file_get_contents($url, false, $ctx);
+    $responseHeaders = $http_response_header ?? [];
+    $statusCode = extractHttpStatusCode($responseHeaders);
+    $ok = $body !== false && $statusCode >= 200 && $statusCode < 300;
+
+    return [
+        'ok' => $ok,
+        'status' => $statusCode,
+        'body' => $body === false ? '' : $body,
+        'headers' => $responseHeaders,
+    ];
+}
+
+function extractHttpStatusCode($responseHeaders) {
+    foreach ($responseHeaders as $headerLine) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $headerLine, $matches)) {
+            return (int) $matches[1];
+        }
+    }
+
+    return 0;
+}
+
+function findResponseHeader($responseHeaders, $headerName) {
+    foreach ($responseHeaders as $headerLine) {
+        if (stripos($headerLine, $headerName . ':') === 0) {
+            return trim(substr($headerLine, strlen($headerName) + 1));
+        }
+    }
+
+    return null;
+}
+
+function isRecognizedImageBytes($bytes) {
+    if (!is_string($bytes) || $bytes === '') {
+        return false;
+    }
+
+    if (strncmp($bytes, "\x89PNG", 4) === 0) {
+        return true;
+    }
+    if (strncmp($bytes, "\xFF\xD8\xFF", 3) === 0) {
+        return true;
+    }
+    if (strncmp($bytes, "GIF8", 4) === 0) {
+        return true;
+    }
+
+    return false;
 }
 ?>
